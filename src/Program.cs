@@ -21,15 +21,79 @@ internal static class Program
         Application.SetCompatibleTextRenderingDefault(false);
 
         bool demo = args.Contains("--demo", StringComparer.OrdinalIgnoreCase);
+        bool showOnStart = args.Contains("--show", StringComparer.OrdinalIgnoreCase);
         string? probePath = GetOption(args, "--probe");
         string? previewPath = GetOption(args, "--icon-preview");
         string? uiPreviewPath = GetOption(args, "--ui-preview");
         string? makeIconPath = GetOption(args, "--make-icon");
         string? trayInfoPath = GetOption(args, "--tray-info");
+        string? permCheckPath = GetOption(args, "--perm-check");
+
+        if (permCheckPath is not null)
+        {
+            File.WriteAllText(permCheckPath,
+                SecurityContext.IsLowIntegrity() ? "low" : "normal");
+            return;
+        }
+
+        // 语音诊断：--voices <文件> 列出本机发音人；--speak <文本> 直接试播。
+        string? voicesPath = GetOption(args, "--voices");
+        if (voicesPath is not null)
+        {
+            using var announcer = new VoiceAnnouncer(true);
+            var info = new StringBuilder();
+            info.AppendLine("selected=" + announcer.VoiceName);
+            info.AppendLine("available=" + announcer.Available);
+            foreach (string name in announcer.InstalledNames())
+            {
+                info.AppendLine("voice=" + name);
+            }
+
+            File.WriteAllText(voicesPath, info.ToString(), Encoding.UTF8);
+            return;
+        }
+
+        string? speakText = GetOption(args, "--speak");
+        if (speakText is not null)
+        {
+            using var announcer = new VoiceAnnouncer(true);
+            announcer.Announce(speakText, false);
+            Thread.Sleep(7000);
+            return;
+        }
+
+        string? speakWavePath = GetOption(args, "--speak-wave");
+        if (speakWavePath is not null)
+        {
+            using var announcer = new VoiceAnnouncer(true);
+            bool ok = announcer.SynthesizeToWave(
+                "ATK V75X 电量仅剩 8%，请及时更换电池或充电。", speakWavePath);
+            File.WriteAllText(speakWavePath + ".result.txt",
+                (ok ? "OK" : "FAIL") + " voice=" + announcer.VoiceName);
+            return;
+        }
+
 
         if (uiPreviewPath is not null)
         {
             RunUiPreview(uiPreviewPath);
+            return;
+        }
+
+        string? menuPreviewPath = GetOption(args, "--menu-preview");
+        if (menuPreviewPath is not null)
+        {
+            using var trayContext = new TrayApplicationContext(true);
+            var monitorResult = new BatteryMonitor(true, new DeviceTracker()).Read();
+            trayContext.RenderMenuPreview(monitorResult, menuPreviewPath);
+            return;
+        }
+
+        string? brandPreviewPath = GetOption(args, "--brand-preview");
+        if (brandPreviewPath is not null)
+        {
+            using var sheet = VendorIcons.RenderBrandSheet();
+            sheet.Save(brandPreviewPath, ImageFormat.Png);
             return;
         }
 
@@ -76,7 +140,8 @@ internal static class Program
             return;
         }
 
-        using var context = new TrayApplicationContext(demo, showEvent, trayInfoPath);
+        using var context = new TrayApplicationContext(
+            demo, showEvent, trayInfoPath, showOnStart);
         Application.Run(context);
     }
 
@@ -102,6 +167,25 @@ internal static class Program
 
     private static void RunUiPreview(string path)
     {
+        try
+        {
+            RunUiPreviewCore(path);
+        }
+        catch (Exception ex)
+        {
+            try
+            {
+                File.WriteAllText(path + ".err.txt", ex.ToString());
+            }
+            catch
+            {
+                // 忽略诊断输出失败。
+            }
+        }
+    }
+
+    private static void RunUiPreviewCore(string path)
+    {
         var result = new BatteryMonitor(demo: true).Read();
         using var form = new DeviceDetailsForm(null)
         {
@@ -123,11 +207,14 @@ internal static class Program
         form.Close();
     }
 
+
     private static void RunProbe(string path, bool demo)
     {
-        var monitor = new BatteryMonitor(demo);
-        var raw = monitor.Read();
         var cache = ReadingCache.Load();
+        var tracker = new BatteryTray.Hid.DeviceTracker();
+        tracker.Seed(cache.All());
+        var monitor = new BatteryMonitor(demo, tracker);
+        var raw = monitor.Read();
         cache.Store(raw);
         var result = cache.Enrich(raw);
         IReadOnlyList<HidInterface> interfaces = Array.Empty<HidInterface>();
@@ -171,7 +258,11 @@ internal static class Program
                 d.Level,
                 d.Charging,
                 d.Source,
-                d.Error
+                d.Error,
+                d.IsOffline,
+                d.LastSeenAt,
+                d.IsStale,
+                Status = d.StatusText
             })
         };
 

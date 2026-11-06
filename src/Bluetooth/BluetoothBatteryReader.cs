@@ -1,17 +1,25 @@
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.RegularExpressions;
+using BatteryTray.Hid;
 
 namespace BatteryTray.Bluetooth;
 
+/// <summary>蓝牙扫描结果：在线设备读数 + 本轮所有枚举到的蓝牙节点键。</summary>
+internal sealed record BluetoothScanResult(
+    IReadOnlyList<Hid.PeripheralReading> Online,
+    IReadOnlySet<string> PresentKeys);
+
 internal sealed class BluetoothBatteryReader
 {
-    private static readonly TimeSpan MaxBleIdle = TimeSpan.FromDays(7);
-
-    public IReadOnlyList<Hid.PeripheralReading> Read()
+    public BluetoothScanResult Read()
     {
         var classicDevices = BluetoothConnectionFilter.GetClassicDevices();
+        // 用 Windows 官方 WinRT 设备枚举的 IsConnected 属性判定 BLE 当前连接状态，
+        // 比 setupapi 的 started/电量缓存/HID 接口存在性可靠。
+        var bleConnected = GetBleConnectionStates();
         var found = new Dictionary<string, BluetoothNode>(StringComparer.OrdinalIgnoreCase);
+        var presentKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (var (enumerator, flags) in new (string? Enumerator, uint Flags)[]
                  {
                      ("BTHENUM", BluetoothNative.DIGCF_PRESENT),
@@ -46,6 +54,8 @@ internal sealed class BluetoothBatteryReader
                         continue;
                     }
 
+                    presentKeys.Add($"BT:{instanceId}");
+
                     int? level = BluetoothNative.ReadBatteryLevel(set, ref info);
                     if (level is null || level <= 0 || level > 100)
                     {
@@ -61,7 +71,7 @@ internal sealed class BluetoothBatteryReader
                     string name = CleanName(originalName);
                     bool handsFree = LooksLikeHandsFree(originalName);
                     DateTime? lastConnected = BluetoothNative.ReadLastConnectedTime(set, ref info);
-                    if (!IsConnected(instanceId, name, lastConnected, classicDevices))
+                    if (!IsConnected(instanceId, name, lastConnected, classicDevices, bleConnected))
                     {
                         continue;
                     }
@@ -99,37 +109,82 @@ internal sealed class BluetoothBatteryReader
             });
         }
 
-        return result;
+        return new BluetoothScanResult(result, presentKeys);
     }
 
     private static bool IsConnected(
         string instanceId,
         string cleanedName,
         DateTime? lastConnected,
-        IReadOnlyList<ClassicBluetoothDevice> classicDevices)
+        IReadOnlyList<ClassicBluetoothDevice> classicDevices,
+        IReadOnlyDictionary<string, bool> bleConnected)
     {
+        // 经典蓝牙（HFP / 耳机）以系统当前连接状态为准，断开即离线。
         if (instanceId.StartsWith("BTHENUM", StringComparison.OrdinalIgnoreCase))
         {
             var matching = classicDevices
                 .Where(d => NamesEqual(d.Name, cleanedName))
                 .ToList();
-            if (matching.Count > 0)
-            {
-                return matching.Any(d => d.Connected);
-            }
-
-            // 少数 HFP 节点在经典 API 中不可见，退回到最近连接时间。
-            return lastConnected is not null &&
-                   DateTime.UtcNow - lastConnected.Value.ToUniversalTime() <= MaxBleIdle;
+            return matching.Count > 0 && matching.Any(d => d.Connected);
         }
 
+        // BLE：读取 WinRT 设备枚举里的 IsConnected 属性（官方权威连接状态）。
         if (instanceId.StartsWith("BTHLE", StringComparison.OrdinalIgnoreCase))
         {
-            return lastConnected is not null &&
-                   DateTime.UtcNow - lastConnected.Value.ToUniversalTime() <= MaxBleIdle;
+            string addr = instanceId.StartsWith("BTHLE\\DEV_", StringComparison.OrdinalIgnoreCase)
+                ? instanceId.Substring("BTHLE\\DEV_".Length, 12)
+                : instanceId;
+            if (bleConnected.TryGetValue(addr, out bool connected))
+            {
+                return connected;
+            }
+
+            // 枚举里没有该设备记录（未配对/未入缓存）：不误杀，退回“节点在”即视为在线。
+            return true;
         }
 
         return false;
+    }
+
+    /// <summary>枚举 BLE 设备，读取官方 IsConnected 属性，映射 蓝牙地址 → 是否已连接。</summary>
+    private static Dictionary<string, bool> GetBleConnectionStates()
+    {
+        var map = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+        try
+        {
+            var selector = Windows.Devices.Bluetooth.BluetoothLEDevice.GetDeviceSelector();
+            var props = new[] { "System.Devices.Aep.IsConnected" };
+            var task = Windows.Devices.Enumeration.DeviceInformation
+                .FindAllAsync(selector, props)
+                .AsTask();
+            task.Wait();
+            foreach (var device in task.Result)
+            {
+                string id = device.Id ?? "";
+                int dash = id.LastIndexOf('-');
+                if (dash < 0 || dash + 1 >= id.Length)
+                {
+                    continue;
+                }
+
+                string remote = id.Substring(dash + 1).Replace(":", "").Trim();
+                if (remote.Length != 12)
+                {
+                    continue;
+                }
+
+                bool connected = device.Properties.TryGetValue(
+                        "System.Devices.Aep.IsConnected", out object? value) &&
+                    value is bool b && b;
+                map[remote] = connected;
+            }
+        }
+        catch
+        {
+            // WinRT 调用失败时退回空表（不误杀）。
+        }
+
+        return map;
     }
 
     private static bool NamesEqual(string left, string right)
@@ -163,27 +218,7 @@ internal sealed class BluetoothBatteryReader
 
     private static Hid.PeripheralKind InferKind(string name)
     {
-        string lower = name.ToLowerInvariant();
-        if (lower.Contains("mouse") || lower.Contains("鼠标") ||
-            lower.Contains("triathlon") || lower.Contains("mx master") ||
-            lower.Contains("mx anywhere") || lower.Contains("trackball"))
-        {
-            return Hid.PeripheralKind.Mouse;
-        }
-
-        if (lower.Contains("keyboard") || lower.Contains("键盘"))
-        {
-            return Hid.PeripheralKind.Keyboard;
-        }
-
-        if (LooksLikeHandsFree(name) || lower.Contains("headphone") ||
-            lower.Contains("earbud") || lower.Contains("buds") ||
-            lower.Contains("airpods") || lower.Contains("耳机"))
-        {
-            return Hid.PeripheralKind.Headset;
-        }
-
-        return Hid.PeripheralKind.Other;
+        return Hid.KindGuesser.FromName(name);
     }
 
     private static string CleanName(string name)
@@ -340,6 +375,7 @@ internal static class BluetoothNative
     internal const uint DIGCF_ALLCLASSES = 0x04;
     private const uint SPDRP_DEVICEDESC = 0x00;
     private const uint SPDRP_FRIENDLYNAME = 0x0C;
+    internal const uint SPDRP_SYMBOLIC_LINK = 0x08;
     private const uint DEVPROP_TYPE_BYTE = 0x00000003;
     private const uint DEVPROP_TYPE_UINT32 = 0x00000007;
 
@@ -387,7 +423,7 @@ internal static class BluetoothNative
 
     [DllImport("setupapi.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
-    private static extern bool SetupDiGetDeviceRegistryPropertyW(
+    internal static extern bool SetupDiGetDeviceRegistryPropertyW(
         IntPtr deviceInfoSet, ref SP_DEVINFO_DATA deviceInfoData,
         uint property, out uint propertyRegDataType, byte[] propertyBuffer,
         uint propertyBufferSize, out uint requiredSize);
@@ -481,7 +517,9 @@ internal static class BluetoothNative
 
         try
         {
-            return DateTime.FromFileTimeUtc((long)fileTime);
+            // 该属性在系统上以本地钟面的 FILETIME 保存；按本地解释，
+            // 与 DateTime.Now 比较才是同一时区。
+            return DateTime.FromFileTime((long)fileTime);
         }
         catch (ArgumentOutOfRangeException)
         {

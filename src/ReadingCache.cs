@@ -39,6 +39,9 @@ internal sealed class ReadingCache
         return new ReadingCache(path, []);
     }
 
+    /// <summary>当前缓存中的所有读数（含设备键），用于启动时为设备状态跟踪器预置“最后在线时间”。</summary>
+    public IEnumerable<KeyValuePair<string, CachedReading>> All() => _entries;
+
     public void Store(MonitorResult result)
     {
         if (result.IsDemo)
@@ -92,6 +95,7 @@ internal sealed class ReadingCache
         foreach (var device in result.Devices)
         {
             if (device.Level is not null ||
+                device.IsOffline || // 离线设备保留原样，不回填为“上次读数”
                 !_entries.TryGetValue(device.Key, out var cached) ||
                 DateTime.Now - cached.UpdatedAt > MaxAge)
             {
@@ -126,6 +130,7 @@ internal sealed class ReadingCache
         {
             Devices = devices,
             UpdatedAt = result.UpdatedAt,
+            LastSuccessAt = result.LastSuccessAt,
             MinimumLevel = minimum,
             Message = message,
             IsDemo = result.IsDemo

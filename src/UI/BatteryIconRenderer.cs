@@ -23,7 +23,8 @@ internal static class BatteryIconRenderer
             return Neutral;
         }
 
-        return level >= 60 ? Green : level >= 20 ? Yellow : Red;
+        // 20% 以下才进入黄色提醒，10% 以下转红，与低电量弹窗阈值保持一致。
+        return level >= 20 ? Green : level >= 10 ? Yellow : Red;
     }
 
     public static string LevelColorName(int? level)
@@ -33,7 +34,7 @@ internal static class BatteryIconRenderer
             return "未知";
         }
 
-        return level >= 60 ? "浅绿" : level >= 20 ? "黄色" : "红色";
+        return level >= 20 ? "浅绿" : level >= 10 ? "黄色" : "红色";
     }
 
     public static Icon CreateTrayIcon(int? level, bool charging, bool bluetooth = false)

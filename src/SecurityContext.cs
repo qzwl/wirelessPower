@@ -28,15 +28,31 @@ internal static class SecurityContext
             }
 
             IntPtr sid = Marshal.ReadIntPtr(buffer, 0);
-            byte subAuthorityCount = GetSidSubAuthorityCount(sid);
+            IntPtr countPointer = GetSidSubAuthorityCount(sid);
+            if (countPointer == IntPtr.Zero)
+            {
+                return false;
+            }
+
+            // GetSidSubAuthorityCount 返回的是指向字节的指针，必须解引用读取，
+            // 直接把返回值当 byte 会拿到指针自身的低位，导致随机误判。
+            byte subAuthorityCount = Marshal.ReadByte(countPointer);
             if (subAuthorityCount == 0)
             {
                 return false;
             }
 
             IntPtr subAuthority = GetSidSubAuthority(sid, (uint)(subAuthorityCount - 1));
+            if (subAuthority == IntPtr.Zero)
+            {
+                return false;
+            }
+
             int integrityRid = Marshal.ReadInt32(subAuthority);
-            return integrityRid < 0x2000;
+
+            // 0x1000 = Low，0x2000 = Medium。只有真正的低完整性/不受信任才拦截，
+            // 避免边界值把普通权限误判掉。
+            return integrityRid < 0x1000;
         }
         catch
         {
@@ -74,7 +90,7 @@ internal static class SecurityContext
         uint tokenInformationLength, out uint returnLength);
 
     [DllImport("advapi32.dll")]
-    private static extern byte GetSidSubAuthorityCount(IntPtr sid);
+    private static extern IntPtr GetSidSubAuthorityCount(IntPtr sid);
 
     [DllImport("advapi32.dll")]
     private static extern IntPtr GetSidSubAuthority(IntPtr sid, uint subAuthorityIndex);

@@ -20,10 +20,17 @@ internal sealed class BatteryMonitor
 
     private readonly bool _demo;
     private readonly BluetoothBatteryReader _bluetooth = new();
+    private readonly DeviceTracker _tracker;
 
-    public BatteryMonitor(bool demo = false)
+    public BatteryMonitor(bool demo = false, DeviceTracker? tracker = null)
     {
         _demo = demo;
+        _tracker = tracker ?? new DeviceTracker();
+        if (!demo)
+        {
+            // 恢复上次运行留下的在线/离线时间，避免重启后时长从零开始。
+            _tracker.LoadState();
+        }
     }
 
     public Task<MonitorResult> ReadAsync(CancellationToken cancellationToken = default)
@@ -95,13 +102,16 @@ internal sealed class BatteryMonitor
             }
 
             // 蓝牙设备走 Windows 的 PnP 电量属性（HFP 节点）。HID 已经读到
-            // 同名设备时不重复显示。
+            // 同名设备时不重复显示。蓝牙节点（含断开的）交给状态跟踪器判断离线。
+            IReadOnlySet<string> blePresentKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             try
             {
+                var scan = _bluetooth.Read();
+                blePresentKeys = scan.PresentKeys;
                 var hidNames = results
                     .Select(r => NormalizeName(r.Name))
                     .ToHashSet(StringComparer.OrdinalIgnoreCase);
-                foreach (var bluetooth in _bluetooth.Read())
+                foreach (var bluetooth in scan.Online)
                 {
                     if (!hidNames.Contains(NormalizeName(bluetooth.Name)))
                     {
@@ -112,6 +122,32 @@ internal sealed class BatteryMonitor
             catch
             {
                 // 蓝牙服务不可用时不影响 USB 设备读取。
+            }
+
+            // 设备状态跟踪：记录本轮在线、清理已移除节点、为断开的蓝牙生成离线读数。
+            var presentKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var group in groups)
+            {
+                presentKeys.Add(group.Key);
+            }
+            presentKeys.UnionWith(blePresentKeys);
+
+            _tracker.RecordOnline(results);
+            _tracker.RemoveAbsent(presentKeys);
+            results.AddRange(_tracker.BuildOffline(blePresentKeys));
+
+            // 旧缓存里可能存着“外设”，用名称再推断一次，避免历史记录一直显示外设。
+            foreach (var reading in results)
+            {
+                if (reading.Kind == PeripheralKind.Other)
+                {
+                    reading.Kind = KindGuesser.FromName(reading.Name);
+                }
+            }
+
+            if (!_demo)
+            {
+                _tracker.SaveState();
             }
 
             var ordered = results
@@ -130,12 +166,19 @@ internal sealed class BatteryMonitor
                     ? "发现外设，但未能读取电量"
                     : null;
 
+            DateTime lastSuccess = _tracker.LastSuccessAt;
+            if (lastSuccess == DateTime.MinValue)
+            {
+                lastSuccess = DateTime.Now;
+            }
+
             return new MonitorResult
             {
                 Devices = ordered,
                 MinimumLevel = minimum,
                 Message = message,
-                UpdatedAt = DateTime.Now
+                UpdatedAt = DateTime.Now,
+                LastSuccessAt = lastSuccess
             };
         }
         catch (OperationCanceledException)
@@ -196,9 +239,9 @@ internal sealed class BatteryMonitor
             },
             new()
             {
-                Key = "demo-darkrim",
-                Name = "DARKRIM SHADOW",
-                Kind = PeripheralKind.Headset,
+                Key = "demo-seewo",
+                Name = "seewo M02W-A",
+                Kind = PeripheralKind.Mouse,
                 Level = 54,
                 Charging = true,
                 Source = "演示数据",

@@ -34,17 +34,31 @@ internal sealed class TrayApplicationContext : ApplicationContext
     private bool _pendingMenuRebuild;
     private volatile bool _pendingShow;
 
+    // 低电量提醒：低于 20% 提醒一次，低于 10% 再升级提醒一次；
+    // 电量回升到 20% 以上才清除记录，避免每轮刷新都弹。
+    private const int WarnLevel = 20;
+    private const int CriticalLevel = 10;
+    private readonly Dictionary<string, int> _batteryAlerts = new();
+    private readonly HashSet<string> _chargedAnnounced = new();
+    private readonly VoiceAnnouncer _voice;
+    private readonly bool _demo;
+
     public TrayApplicationContext(
-        bool demo = false, EventWaitHandle? showEvent = null, string? trayInfoPath = null)
+        bool demo = false, EventWaitHandle? showEvent = null, string? trayInfoPath = null,
+        bool openOnStart = false)
     {
         _showEvent = showEvent;
         _trayInfoPath = trayInfoPath;
+        _demo = demo;
         _settings = AppSettings.Load();
         AutoStartManager.RepairPathIfNeeded();
-        _monitor = new BatteryMonitor(demo);
+        var tracker = new DeviceTracker();
         _cache = ReadingCache.Load();
+        tracker.Seed(_cache.All());
+        _monitor = new BatteryMonitor(demo, tracker);
         _menuFont = new Font("Microsoft YaHei UI", 9F, FontStyle.Regular, GraphicsUnit.Point);
         _boldMenuFont = new Font(_menuFont, FontStyle.Bold);
+        _voice = new VoiceAnnouncer(_settings.VoiceEnabled);
 
         _currentIcon = BatteryIconRenderer.CreateTrayIcon(null, false);
         _notifyIcon = new NotifyIcon
@@ -76,6 +90,9 @@ internal sealed class TrayApplicationContext : ApplicationContext
 
         SystemEvents.PowerModeChanged += OnPowerModeChanged;
 
+        // --show 启动时直接把详情窗口显示出来，方便从快捷方式一眼看到界面。
+        _pendingShow = openOnStart;
+
         if (showEvent is not null)
         {
             _showWait = ThreadPool.RegisterWaitForSingleObject(
@@ -96,8 +113,21 @@ internal sealed class TrayApplicationContext : ApplicationContext
         }
     }
 
-    private void OnTimerTick(object? sender, EventArgs e)
+    /// <summary>诊断用：把托盘右键菜单渲染成 PNG，方便核对菜单排版。</summary>
+    internal void RenderMenuPreview(MonitorResult result, string path)
     {
+        var menu = BuildMenu(result);
+        menu.Show(new Point(4, 4));
+        Application.DoEvents();
+        var bitmap = new Bitmap(menu.Width, menu.Height);
+        menu.DrawToBitmap(bitmap, new Rectangle(0, 0, menu.Width, menu.Height));
+        bitmap.Save(path, System.Drawing.Imaging.ImageFormat.Png);
+        bitmap.Dispose();
+        menu.Close();
+        menu.Dispose();
+    }
+
+    private void OnTimerTick(object? sender, EventArgs e)    {
         _sync = SynchronizationContext.Current;
         if (_firstTick)
         {
@@ -165,7 +195,8 @@ internal sealed class TrayApplicationContext : ApplicationContext
             {
                 Devices = Array.Empty<PeripheralReading>(),
                 Message = $"刷新失败：{ex.Message}",
-                UpdatedAt = DateTime.Now
+                UpdatedAt = DateTime.Now,
+                LastSuccessAt = DateTime.Now
             };
             UpdatePresentation(_lastResult);
         }
@@ -191,6 +222,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
 
         SetTooltip(result);
         RebuildMenuIfNeeded(result);
+        CheckLowBattery(result);
         if (_details is { IsDisposed: false })
         {
             _details.UpdateResult(result, _settings.RefreshSeconds);
@@ -207,7 +239,145 @@ internal sealed class TrayApplicationContext : ApplicationContext
         }
     }
 
-    private void SetTooltip(MonitorResult result)    {
+    /// <summary>
+    /// 电量跨过 20% / 10% 阈值时弹一次托盘通知并语音播报一次，回升后自动复位；
+    /// 充到 100% 说一句已充满。充电中、离线、读数缺失的设备都不参与提醒。
+    /// </summary>
+    private void CheckLowBattery(MonitorResult result)
+    {
+        if (_demo)
+        {
+            // 演示模式默认不弹提醒，允许用环境变量打开以便自测文案。
+            if (Environment.GetEnvironmentVariable("BATTERY_TRAY_DEMO_ALERTS") is null)
+            {
+                return;
+            }
+        }
+
+        List<string> speech = new();
+        bool urgent = false;
+
+        Dictionary<string, int> current = new();
+        foreach (var device in result.Devices)
+        {
+            if (device.IsOffline || device.Charging == true || device.Level is not int level)
+            {
+                continue;
+            }
+
+            if (level >= WarnLevel)
+            {
+                continue;
+            }
+
+            current[device.Key] = level < CriticalLevel ? 2 : 1;
+        }
+
+        // 电量回升或设备消失时清掉记录，下次再变低还会提醒。
+        foreach (string key in _batteryAlerts.Keys.ToList())
+        {
+            if (current.ContainsKey(key))
+            {
+                continue;
+            }
+
+            _batteryAlerts.Remove(key);
+            var restored = result.Devices.FirstOrDefault(device => device.Key == key);
+            if (restored is { IsOffline: false, Level: >= WarnLevel })
+            {
+                speech.Add($"{DisplayName(restored)} 电量已恢复到 {restored.Level}%");
+            }
+        }
+
+        List<(string Name, int Level, int Severity)> raised = new();
+        foreach (var device in result.Devices)
+        {
+            if (!current.TryGetValue(device.Key, out int severity))
+            {
+                continue;
+            }
+
+            int seen = _batteryAlerts.TryGetValue(device.Key, out int previous) ? previous : 0;
+            if (severity > seen)
+            {
+                raised.Add((DisplayName(device), device.Level!.Value, severity));
+            }
+        }
+
+        foreach (var entry in current)
+        {
+            _batteryAlerts[entry.Key] = entry.Value;
+        }
+
+        if (raised.Count > 0)
+        {
+            bool critical = raised.Exists(item => item.Severity == 2);
+            urgent = critical;
+            _notifyIcon.BalloonTipTitle = critical ? "电量紧急" : "电量警告";
+            _notifyIcon.BalloonTipIcon = critical ? ToolTipIcon.Error : ToolTipIcon.Warning;
+            _notifyIcon.BalloonTipText = BuildBatteryAlertText(raised, critical);
+            _notifyIcon.ShowBalloonTip(critical ? 15000 : 10000);
+
+            foreach (var item in raised)
+            {
+                speech.Add(item.Severity == 2
+                    ? $"{item.Name} 电量仅剩 {item.Level}%，请及时更换电池或充电"
+                    : $"{item.Name} 电量剩余 {item.Level}%，请关注");
+            }
+        }
+
+        // 充满提醒：只在“正在充电且到 100%”那一刻说一次，电量掉下来后复位。
+        foreach (var device in result.Devices)
+        {
+            if (device.IsOffline || device.Charging != true || device.Level is not int level)
+            {
+                _chargedAnnounced.Remove(device.Key);
+                continue;
+            }
+
+            if (level < 100)
+            {
+                _chargedAnnounced.Remove(device.Key);
+                continue;
+            }
+
+            if (_chargedAnnounced.Add(device.Key))
+            {
+                speech.Add($"{DisplayName(device)} 电量已充满，可以断开充电器了");
+            }
+        }
+
+        if (speech.Count > 0)
+        {
+            _voice.Announce(string.Join("。", speech) + "。", urgent);
+        }
+    }
+
+    private static string DisplayName(PeripheralReading device)
+    {
+        return string.IsNullOrWhiteSpace(device.Name) ? "设备" : device.Name!;
+    }
+
+    private static string BuildBatteryAlertText(
+        List<(string Name, int Level, int Severity)> items, bool critical)
+    {
+        var ordered = items
+            .OrderByDescending(item => item.Severity)
+            .ThenBy(item => item.Level)
+            .ToList();
+        string detail = string.Join("、",
+            ordered.Take(2).Select(item => $"{item.Name} 仅剩 {item.Level}%"));
+        string advice = critical ? "请立即充电。" : "建议尽快充电。";
+        if (ordered.Count > 2)
+        {
+            advice += $"另有 {ordered.Count - 2} 台设备电量偏低。";
+        }
+
+        return detail + "，" + advice;
+    }
+
+    private void SetTooltip(MonitorResult result)
+    {
         try
         {
             _notifyIcon.Text = BuildTooltip(result, 127);
@@ -240,9 +410,12 @@ internal sealed class TrayApplicationContext : ApplicationContext
         for (int nameLimit = 22; nameLimit >= 4; nameLimit -= 2)
         {
             var builder = new StringBuilder();
+            DateTime lastRead = result.LastSuccessAt == DateTime.MinValue
+                ? result.UpdatedAt
+                : result.LastSuccessAt;
             string header = result.MinimumLevel is null
-                ? $"无线外设 · {result.UpdatedAt:HH:mm}"
-                : $"无线外设 最低{result.MinimumLevel}% · {result.UpdatedAt:HH:mm}";
+                ? $"无线外设 · {lastRead:HH:mm}"
+                : $"无线外设 最低{result.MinimumLevel}% · {lastRead:HH:mm}";
             builder.Append(header);
 
             int shown = 0;
@@ -255,9 +428,15 @@ internal sealed class TrayApplicationContext : ApplicationContext
                 }
 
                 string line = device.Level is null
-                    ? $"\n{name}  未读取"
+                    ? device.IsOffline
+                        ? $"\n{name}  离线 {device.LastSeenAt:MM-dd HH:mm}"
+                        : $"\n{name}  未读取"
                     : $"\n{name}  {device.Level}%";
-                if (device.IsStale)
+                if (device.IsOffline)
+                {
+                    // 离线状态已在上方体现。
+                }
+                else if (device.IsStale)
                 {
                     line += " 上次";
                 }
@@ -349,13 +528,51 @@ internal sealed class TrayApplicationContext : ApplicationContext
         }
     }
 
+    private static readonly Dictionary<Color, Image> _dotCache = new();
+
+    private static Image MenuDot(PeripheralReading device)
+    {
+        Color color = device.IsOffline
+            ? Color.FromArgb(190, 198, 208)
+            : device.Level is null
+                ? Color.FromArgb(210, 84, 84)
+                : device.Level >= 60
+                    ? Color.FromArgb(34, 197, 94)
+                    : device.Level >= 20
+                        ? Color.FromArgb(240, 165, 40)
+                        : Color.FromArgb(225, 70, 70);
+        if (_dotCache.TryGetValue(color, out Image? cached) && cached is not null)
+        {
+            return cached;
+        }
+
+        var bitmap = new Bitmap(12, 12);
+        using (var graphics = Graphics.FromImage(bitmap))
+        {
+            graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+            using var brush = new SolidBrush(color);
+            graphics.FillEllipse(brush, 3, 3, 6, 6);
+        }
+
+        _dotCache[color] = bitmap;
+        return bitmap;
+    }
+
     private ContextMenuStrip BuildMenu(MonitorResult? result = null)
     {
         result ??= _lastResult;
         var menu = new ContextMenuStrip
         {
-            ShowImageMargin = false,
-            Font = _menuFont
+            ShowImageMargin = true,
+            // 关掉独立的勾选列：勾直接落在图标列里，和设备的彩色圆点一条竖线上。
+            ShowCheckMargin = false,
+            ImageScalingSize = new Size(12, 12),
+            Font = _menuFont,
+            BackColor = Color.White,
+            ForeColor = Color.FromArgb(32, 35, 40),
+            Renderer = new UI.ModernMenuRenderer(),
+            Padding = new Padding(4, 6, 4, 6),
+            DropShadowEnabled = true
         };
         menu.Opening += (_, _) => _menuOpen = true;
         menu.Closed += (_, _) =>
@@ -371,31 +588,44 @@ internal sealed class TrayApplicationContext : ApplicationContext
         var title = new ToolStripMenuItem("无线外设电量")
         {
             Enabled = false,
-            Font = _boldMenuFont
+            Font = _boldMenuFont,
+            Tag = "menu-header"
         };
         menu.Items.Add(title);
 
+        DateTime menuLastRead = result?.LastSuccessAt is { } ls && ls != DateTime.MinValue
+            ? ls
+            : result?.UpdatedAt ?? DateTime.Now;
         string summary = result is null
             ? "正在读取…"
             : result.Count == 0
-                ? $"{result.Message ?? "未发现受支持的设备"} · 上次更新 {result.UpdatedAt:HH:mm:ss}"
-                : $"最低 {result.MinimumLevel?.ToString() ?? "未知"}% · 上次更新 {result.UpdatedAt:HH:mm:ss}";
-        menu.Items.Add(new ToolStripMenuItem(summary) { Enabled = false });
+                ? $"{result.Message ?? "未发现受支持的设备"} · 上次更新 {menuLastRead:HH:mm:ss}"
+                : $"最低 {result.MinimumLevel?.ToString() ?? "未知"}% · 上次更新 {menuLastRead:HH:mm:ss}";
+        menu.Items.Add(new ToolStripMenuItem(summary) { Enabled = false, Tag = "menu-subheader" });
 
         if (result is { Count: > 0 })
         {
             menu.Items.Add(new ToolStripSeparator());
-            foreach (var device in result.Devices)
+            var visibleDevices = result.Devices.Where(MatchesFilter).ToList();
+            if (visibleDevices.Count == 0)
+            {
+                menu.Items.Add(new ToolStripMenuItem("（当前筛选下没有设备）") { Enabled = false });
+            }
+
+            foreach (var device in visibleDevices)
             {
                 string level = device.Level is null ? "未读取" : $"{device.Level}%";
-                string text = device.Level is null
-                    ? $"{device.DisplayName}（{device.KindText}）  {level}"
-                    : $"{device.DisplayName}（{device.KindText}）  {level}  {device.StatusText}";
+                string text = device.IsOffline
+                    ? $"{device.DisplayName}（{device.KindText}）  离线"
+                    : device.Level is null
+                        ? $"{device.DisplayName}（{device.KindText}）  {level}"
+                        : $"{device.DisplayName}（{device.KindText}）  {level}  {device.StatusText}";
                 var item = new ToolStripMenuItem(text)
                 {
                     ForeColor = device.Level is null
                         ? Color.FromArgb(160, 65, 65)
                         : MenuColor(device.Level.Value),
+                    Image = MenuDot(device),
                     ToolTipText = device.Source
                 };
                 item.Click += (_, _) => ShowDetails();
@@ -425,6 +655,39 @@ internal sealed class TrayApplicationContext : ApplicationContext
         menu.Items.Add(interval);
         menu.Items.Add(new ToolStripSeparator());
 
+        var filterMenu = new ToolStripMenuItem("显示筛选");
+        foreach (var (key, label) in new (string Key, string Label)[]
+                 {
+                     ("all", "全部"),
+                     ("online", "仅在线"),
+                     ("offline", "仅离线")
+                 })
+        {
+            var filterItem = new ToolStripMenuItem(label)
+            {
+                Checked = _settings.FilterMode == key,
+                CheckOnClick = false
+            };
+            filterItem.Click += (_, _) => SetFilterMode(key);
+            filterMenu.DropDownItems.Add(filterItem);
+        }
+
+        menu.Items.Add(filterMenu);
+
+        var voiceItem = new ToolStripMenuItem("语音提醒")
+        {
+            Checked = _settings.VoiceEnabled,
+            CheckOnClick = true
+        };
+        voiceItem.CheckedChanged += (_, _) =>
+        {
+            _settings.VoiceEnabled = voiceItem.Checked;
+            _voice.Enabled = voiceItem.Checked;
+            _settings.Save();
+        };
+        menu.Items.Add(voiceItem);
+        menu.Items.Add(new ToolStripSeparator());
+
         var details = new ToolStripMenuItem("设备详情…");
         details.Click += (_, _) => ShowDetails();
         menu.Items.Add(details);
@@ -433,14 +696,40 @@ internal sealed class TrayApplicationContext : ApplicationContext
         exit.Click += (_, _) => ExitApplication();
         menu.Items.Add(exit);
 
+        ApplyMenuSpacing(menu);
+
         return menu;
     }
 
+    /// <summary>统一行距，并让所有子菜单的勾也落在图标列，跟主菜单保持同一套间距。</summary>
+    private static void ApplyMenuSpacing(ToolStrip strip)
+    {
+        foreach (ToolStripItem item in strip.Items)
+        {
+            if (item is ToolStripSeparator)
+            {
+                continue;
+            }
+
+            item.Padding = new Padding(0, 2, 0, 2);
+
+            if (item is ToolStripMenuItem menuItem && menuItem.HasDropDownItems)
+            {
+                if (menuItem.DropDown is ContextMenuStrip dropDown)
+                {
+                    dropDown.ShowCheckMargin = false;
+                }
+
+                ApplyMenuSpacing(menuItem.DropDown);
+            }
+        }
+    }
+
     private static Color MenuColor(int level)    {
-        return level >= 60
-            ? Color.FromArgb(22, 126, 68)
-            : level >= 20
-                ? Color.FromArgb(164, 112, 0)
+        return level >= 20
+            ? Color.FromArgb(52, 58, 66)
+            : level >= 10
+                ? Color.FromArgb(176, 118, 10)
                 : Color.FromArgb(190, 42, 42);
     }
 
@@ -464,6 +753,37 @@ internal sealed class TrayApplicationContext : ApplicationContext
         {
             RebuildMenu(_lastResult);
             _details?.UpdateResult(_lastResult, _settings.RefreshSeconds);
+        }
+    }
+
+    private bool MatchesFilter(PeripheralReading device)
+    {
+        return _settings.FilterMode switch
+        {
+            "online" => device.Level is not null && !device.IsOffline,
+            "offline" => device.IsOffline,
+            _ => true
+        };
+    }
+
+    private void SetFilterMode(string mode)
+    {
+        _settings.FilterMode = AppSettings.NormalizeFilter(mode);
+        _settings.Save();
+        if (_lastResult is not null)
+        {
+            RebuildMenu(_lastResult);
+            _details?.SetFilter(_settings.FilterMode);
+        }
+    }
+
+    private void OnDetailsFilterChanged(string mode)
+    {
+        _settings.FilterMode = AppSettings.NormalizeFilter(mode);
+        _settings.Save();
+        if (_lastResult is not null)
+        {
+            RebuildMenu(_lastResult);
         }
     }
 
@@ -492,8 +812,10 @@ internal sealed class TrayApplicationContext : ApplicationContext
             return;
         }
 
-        _details = new DeviceDetailsForm(RefreshAsync);
+        _details = new DeviceDetailsForm(RefreshAsync, _settings.FilterMode);
         _details.IntervalChanged += SetRefreshInterval;
+        _details.FilterChanged += OnDetailsFilterChanged;
+        _details.ExitRequested += ExitApplication;
         _details.FormClosed += (_, _) =>
         {
             _details?.Dispose();
@@ -705,6 +1027,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
             _details?.Dispose();
             _menuFont.Dispose();
             _boldMenuFont.Dispose();
+            _voice.Dispose();
         }
 
         base.Dispose(disposing);

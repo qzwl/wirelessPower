@@ -6,6 +6,10 @@ internal sealed class AppSettings
 {
     public int RefreshSeconds { get; set; } = 60;
     public bool TrayHintShown { get; set; }
+    /// <summary>设备筛选：all / online / offline。</summary>
+    public string FilterMode { get; set; } = "all";
+    /// <summary>电量变化时是否用语音播报，默认开启。</summary>
+    public bool VoiceEnabled { get; set; } = true;
 
     private static string SettingsDirectory => AppPaths.DataDirectory;
 
@@ -21,6 +25,7 @@ internal sealed class AppSettings
                 if (settings is not null)
                 {
                     settings.RefreshSeconds = Normalize(settings.RefreshSeconds);
+                    settings.FilterMode = NormalizeFilter(settings.FilterMode);
                     return settings;
                 }
             }
@@ -53,5 +58,15 @@ internal sealed class AppSettings
     {
         int[] allowed = [30, 60, 120, 300, 600, 1800];
         return allowed.Contains(seconds) ? seconds : 60;
+    }
+
+    public static string NormalizeFilter(string? mode)
+    {
+        return mode switch
+        {
+            "online" => "online",
+            "offline" => "offline",
+            _ => "all"
+        };
     }
 }

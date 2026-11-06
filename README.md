@@ -4,12 +4,18 @@
 
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11%20x64-0078D4?logo=windows)](https://www.microsoft.com/windows)
 [![.NET](https://img.shields.io/badge/.NET-10%20Desktop%20Runtime-512BD4?logo=dotnet)](https://dotnet.microsoft.com/download/dotnet/10.0)
-[![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+[![License: CC BY-NC-SA 4.0](https://img.shields.io/badge/license-CC%20BY--NC--SA%204.0-lightgrey)](LICENSE)
 [![Version](https://img.shields.io/badge/version-1.2.0-blue)](BatteryTray.csproj)
 
 一个 Windows 10/11 x64 的托盘工具，通过 **USB HID / Windows 蓝牙 PnP 属性**读取 2.4G 无线接收器和蓝牙外设的电量，并在通知区域显示一个「电池 + 角标」图标。
 
 > 不联网、不上传、不写日志；只依赖 .NET 10 Desktop Runtime。
+
+> ⚠️ **本项目是 [`MrZQAQ/wirelessPower`](https://github.com/MrZQAQ/wirelessPower) 的衍生版本。**
+> 上游原始代码按 MIT 许可证发布，其版权声明与许可原文完整保留在
+> [`THIRD-PARTY-NOTICES.md`](THIRD-PARTY-NOTICES.md)。
+> 本衍生版本（含全部修改与新增代码）按 [CC BY-NC-SA 4.0](LICENSE) 授权：
+> **禁止商业使用；衍生作品必须公开源代码并以相同协议共享，不得闭源。**
 
 ---
 
@@ -47,8 +53,26 @@
 - **上次更新时间**：主界面摘要和右键菜单都会显示本轮读取完成时间。
 - **单实例**：重复启动不会产生第二个托盘程序，而是唤起已运行实例的详情窗口。
 - **休眠兜底**：Rapoo 深度休眠时显示最近一次成功读数，标记为“上次”。
-- **单文件发布**：框架依赖单文件 EXE，约 1 MB；不需要打包或解压 .NET runtime。
+- **单文件发布**：框架依赖单文件 EXE，不需要打包或解压 .NET runtime。
 - **本地运行**：不包含 HTTP、socket、遥测或自动更新逻辑。
+
+### 本衍生版本新增（v1.1 / v1.2）
+
+- **如实离线判定**：蓝牙设备用 WinRT `BluetoothLEDevice` 的 `System.Devices.Aep.IsConnected`
+  真实判定连接状态，断开后立即标记离线，不再出现“关掉了还显示在线”。
+- **在线 / 离线时长**：在线显示秒级正计时，离线显示离线时长；状态通过
+  `device-state.json` 落盘，**关闭程序再打开时长不清零**，继续累计。
+- **最近更新时间不漂移**：固定为“最后一次真正读到电量”的时间，不随空刷新前进。
+- **厂商品牌标识**：51 个品牌的内置官方 logo（PNG/SVG，编译进 EXE，不联网、不外置），
+  没有 logo 的品牌回落为字母徽标。
+- **设备类型识别**：自动区分键盘 / 鼠标 / 耳机 / 遥控器 / 其他，遥控器单独造型。
+- **低电量提醒**：低于 20% 弹警告气泡，低于 10% 弹紧急气泡；回升到 20% 以上自动复位。
+- **语音播报（TTS）**：调用系统 SAPI 中文发音人播报
+  “XX 电量剩余 N%，请关注”/“电量仅剩 N%，请及时充电”/“电量已充满”/“电量已恢复”，
+  可在托盘菜单里开关。
+- **三档筛选**：全部 / 仅在线 / 仅离线，方便排查。
+- **界面重构**：无边框圆角窗口、自绘标题栏与胶囊筛选、列表最多显示 6 条超出滚动、
+  列表右缘与按钮右缘对齐、自绘托盘右键菜单（勾选与状态点同列）。
 
 ## 界面预览
 
@@ -342,8 +366,11 @@ Rapoo 的电量来自被动状态包，深度休眠时无法主动唤醒。程�
 - 需要 **.NET 10 Desktop Runtime**；不提供自包含版本。
 - 蓝牙电量依赖 Windows 驱动上报的 PnP 属性，不直接实现各品牌蓝牙私有查询协议。
 - 私有 2.4G 协议可能随固件/批次变化。
-- 不提供开机自启、低电量通知、历史曲线或多语言界面（欢迎 PR）。
+- 不提供电量历史曲线；界面仅中文。
 - 蓝牙深度休眠设备可能停留在“上次读数”，直到重新连接或上报新状态。
+- 品牌 logo 仅覆盖已登记的 51 个品牌，其余品牌显示字母徽标。
+- 低电量气泡依赖 Windows 通知区域，系统“专注助手/请勿打扰”开启时可能不弹窗；
+  语音播报依赖系统已安装的 SAPI 中文发音人（如 Microsoft Huihui）。
 
 ## 隐私
 
@@ -383,9 +410,31 @@ Rapoo 的电量来自被动状态包，深度休眠时无法主动唤醒。程�
 
 ## 许可证
 
-本项目使用 [MIT License](LICENSE)。
+本项目是 [`MrZQAQ/wirelessPower`](https://github.com/MrZQAQ/wirelessPower) 的衍生版本。
+两类许可证同时适用，分别约束不同部分：
 
-私有协议仅用于设备互操作与学习研究。本项目与 ATK、VXE、Rapoo、Sony、Logitech、DARKRIM 等厂商无关联，也未获得其官方授权。
+| 部分 | 许可证 | 说明 |
+|---|---|---|
+| 上游原始代码及由其延续的部分 | **MIT** | 原始版权声明与许可原文见 [`THIRD-PARTY-NOTICES.md`](THIRD-PARTY-NOTICES.md) |
+| 本仓库的修改与新增代码 | **CC BY-NC-SA 4.0** | 全文见 [`LICENSE`](LICENSE) |
+
+本衍生版本整体按 **CC BY-NC-SA 4.0**（知识共享 署名-非商业性使用-相同方式共享 4.0 国际）
+分发，含义是：
+
+- **署名**：必须注明原作者 `MrZQAQ`（上游）和本仓库作者 `qzwl`，并附许可协议链接；
+- **非商业性使用**：**不得将本项目或其衍生作品用于商业目的**——包括销售、付费分发、
+  捆绑进商业产品、用于商业服务交付等，均需另行取得版权持有人的书面授权；
+- **相同方式共享**：修改后若要分发，**必须公开修改后的完整源代码**，
+  并以 CC BY-NC-SA 4.0 或同等（或更严格）且要求开源的协议发布，**不得闭源**。
+
+> 说明：GPL 系列许可证本身允许商业使用，无法同时满足“禁止商用”的要求，
+> 因此本项目没有采用 GPL，而是采用同样要求“署名 + 相同方式共享（派生必须开源）”、
+> 同时明确禁止商业使用的 CC BY-NC-SA 4.0。
+> 若你确实需要 GPL 生态兼容（例如希望并入 GPL 项目），请联系版权持有人另行授权。
+
+私有协议仅用于设备互操作与学习研究。本项目与 ATK、VXE、Rapoo、Sony、Logitech、DARKRIM、
+seewo 等厂商无关联，也未获得其官方授权；界面中的品牌标识归各品牌方所有，仅用于识别设备来源。
+
 
 ## 致谢
 
